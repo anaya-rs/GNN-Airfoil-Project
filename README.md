@@ -274,11 +274,6 @@ evaluates models on unseen airfoils and generates:
 - scatter comparison plots
 - lift coefficient calculations
 
-## code style
-
-- minimal comments (only when necessary)
-- lowercase, human-sounding comments
-- clean, readable code structure
 
 ## results
 
