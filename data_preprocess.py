@@ -6,14 +6,179 @@ import airfrans as af
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 import os
+import zipfile
+import time
+import glob
 
 def load_airfrans_data(split='train', n_samples=None, root='./airfrans_data', task='full'):
     """load airfrans dataset"""
-    # download dataset if not exists
-    if not os.path.exists(root) or not os.path.exists(os.path.join(root, 'manifest.json')):
-        print(f"downloading airfrans dataset to {root}...")
-        os.makedirs(root, exist_ok=True)
-        af.dataset.download(root=root)
+    # check if preprocessed .pth files exist (alternative data format)
+    pth_pattern = os.path.join(root, 'graph_airfrans_data_batch_*', '*.pth')
+    pth_files = sorted(glob.glob(pth_pattern))
+    
+    if pth_files:
+        print(f"found {len(pth_files)} preprocessed .pth files")
+        print("loading preprocessed graph data directly...")
+        
+        all_data = []
+        for pth_file in pth_files:
+            try:
+                # load with weights_only=False for PyTorch Geometric Data objects
+                data = torch.load(pth_file, weights_only=False)
+                if isinstance(data, list):
+                    all_data.extend(data)
+                else:
+                    all_data.append(data)
+            except Exception as e:
+                print(f"warning: could not load {pth_file}: {e}")
+                continue
+        
+        if len(all_data) == 0:
+            raise ValueError("no valid data loaded from .pth files")
+        
+        print(f"loaded {len(all_data)} samples from preprocessed files")
+        
+        # check if these are already graph data objects (have edge_index)
+        # check first few samples to be sure
+        is_graph_data = False
+        for sample in all_data[:min(5, len(all_data))]:
+            if isinstance(sample, Data) or (hasattr(sample, 'edge_index') and hasattr(sample, 'x')):
+                is_graph_data = True
+                break
+        
+        if is_graph_data:
+            print("data is already in graph format, using directly")
+            if n_samples:
+                return all_data[:n_samples]
+            return all_data
+        else:
+            # if they're raw samples, convert to graphs
+            print("converting samples to graph format...")
+            graph_data = []
+            for i, sample in enumerate(all_data):
+                if i % 10 == 0:
+                    print(f"processing sample {i}/{len(all_data)}")
+                try:
+                    graph_data.append(create_graph_data(sample))
+                except Exception as e:
+                    print(f"error processing sample {i}: {e}")
+                    continue
+            if len(graph_data) == 0:
+                raise ValueError("failed to convert any samples to graph format")
+            if n_samples:
+                return graph_data[:n_samples]
+            return graph_data
+    
+    # check if manifest exists, if not download/extract
+    manifest_path = os.path.join(root, 'manifest.json')
+    zip_path = os.path.join(root, 'Dataset.zip')
+    
+    # create root directory if it doesn't exist
+    os.makedirs(root, exist_ok=True)
+    
+    if not os.path.exists(manifest_path):
+        # check if zip exists and is valid (handles manually downloaded files)
+        zip_valid = False
+        if os.path.exists(zip_path):
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as z:
+                    z.testzip()
+                zip_valid = True
+                print(f"found existing zip file: {zip_path}")
+                print("  if you manually downloaded this, it will be used.")
+            except (zipfile.BadZipFile, zipfile.LargeZipFile) as e:
+                print(f"existing zip file is corrupted: {e}")
+                print("  please delete it and re-download or place a valid zip file.")
+                response = input("  delete corrupted zip and try to download? (y/n): ")
+                if response.lower() == 'y':
+                    os.remove(zip_path)
+                else:
+                    raise ValueError("corrupted zip file must be removed or replaced")
+        
+        # download dataset if zip doesn't exist or is invalid
+        if not zip_valid:
+            print(f"\nno valid dataset found in {root}")
+            print("options:")
+            print("  1. manually download Dataset.zip (~9.3GB) and place it in:")
+            print(f"     {os.path.abspath(root)}")
+            print("  2. let the script download it automatically")
+            print("\nchecking for manual download...")
+            
+            # wait a moment in case user just placed the file
+            time.sleep(2)
+            
+            # check again after brief wait
+            if os.path.exists(zip_path):
+                try:
+                    with zipfile.ZipFile(zip_path, 'r') as z:
+                        z.testzip()
+                    zip_valid = True
+                    print(f"found manually placed zip file: {zip_path}")
+                except (zipfile.BadZipFile, zipfile.LargeZipFile) as e:
+                    print(f"manually placed zip file is corrupted: {e}")
+                    raise ValueError("please provide a valid Dataset.zip file")
+            
+            # if still no valid zip, download
+            if not zip_valid:
+                print("\ndownloading dataset (this may take a while, ~9.3GB)...")
+                print("  estimated time:")
+                print("    - fast connection (100 mbps): ~15-20 minutes")
+                print("    - medium connection (50 mbps): ~30-40 minutes")
+                print("    - slow connection (10 mbps): ~2+ hours")
+                print("  you can interrupt and resume later - the zip file will be preserved.")
+                print("  for quick testing, use: python quick_preprocess.py\n")
+                try:
+                    af.dataset.download(root=root)
+                except KeyboardInterrupt:
+                    print("\ndownload interrupted. partial download saved.")
+                    print("  run again to resume download.")
+                    raise
+                except Exception as e:
+                    print(f"\ndownload error: {e}")
+                    print("  you can try again - download should resume.")
+                    print("  or manually download Dataset.zip and place it in:")
+                    print(f"  {os.path.abspath(root)}")
+                    raise
+        
+        # extract if zip exists but manifest doesn't
+        if os.path.exists(zip_path) and not os.path.exists(manifest_path):
+            print(f"\nextracting dataset from {zip_path} (this may take several minutes)...")
+            print("  if you manually extracted the zip, make sure manifest.json is in:")
+            print(f"  {os.path.abspath(root)}")
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(root)
+                print("extraction complete")
+            except zipfile.BadZipFile:
+                print("error: zip file is corrupted.")
+                print("  if you manually downloaded this, please re-download.")
+                print("  or delete the zip and let the script download it.")
+                raise
+    
+    # check for manifest in subdirectories if not in root (recursive search)
+    if not os.path.exists(manifest_path):
+        # look for manifest in subdirectories (handles manual extraction)
+        if os.path.exists(root) and os.path.isdir(root):
+            # recursive search for manifest.json
+            for dirpath, dirnames, filenames in os.walk(root):
+                if 'manifest.json' in filenames:
+                    manifest_path = os.path.join(dirpath, 'manifest.json')
+                    root = dirpath
+                    print(f"found manifest.json in subdirectory: {root}")
+                    break
+    
+    # verify manifest exists before loading
+    if not os.path.exists(manifest_path):
+        error_msg = (
+            f"manifest.json not found in {os.path.abspath(root)}.\n"
+            f"please ensure the dataset was downloaded and extracted correctly.\n\n"
+            f"if you manually downloaded Dataset.zip:\n"
+            f"  1. place it in: {os.path.abspath(root)}\n"
+            f"  2. extract it (or let the script extract it)\n"
+            f"  3. make sure manifest.json is in the extracted folder\n\n"
+            f"or delete any corrupted files and let the script download automatically."
+        )
+        raise FileNotFoundError(error_msg)
     
     # load dataset using airfrans api
     train = (split == 'train')
@@ -232,12 +397,50 @@ def preprocess_dataset(split='train', n_samples=100, save_dir='./data', task='fu
     return normalized_dataset, norm_stats
 
 if __name__ == '__main__':
+    import sys
+    
+    # check if user wants quick mode
+    quick_mode = '--quick' in sys.argv or '-q' in sys.argv
+    
+    if quick_mode:
+        print("=" * 60)
+        print("QUICK MODE - Using smaller dataset for faster processing")
+        print("=" * 60)
+        print("For full dataset, run without --quick flag\n")
+        train_samples = 50
+        val_samples = 20
+        test_samples = 20
+    else:
+        print("=" * 60)
+        print("FULL MODE - Using complete dataset")
+        print("=" * 60)
+        print("For faster testing, use: python data_preprocess.py --quick\n")
+        train_samples = 500
+        val_samples = 100
+        test_samples = 100
+    
+    # check if preprocessed data already exists
+    if os.path.exists('./data/train_dataset.pt') and not quick_mode:
+        print("preprocessed data already exists in ./data/")
+        print("Delete ./data/ folder if you want to regenerate.\n")
+        response = input("Continue anyway? (y/n): ")
+        if response.lower() != 'y':
+            print("Exiting. Use existing data or delete ./data/ to regenerate.")
+            sys.exit(0)
+    
     # preprocess training data
-    train_dataset, norm_stats = preprocess_dataset(split='train', n_samples=500)
+    print(f"Preprocessing training data ({train_samples} samples)...")
+    train_dataset, norm_stats = preprocess_dataset(split='train', n_samples=train_samples)
     
     # preprocess validation data
-    val_dataset, _ = preprocess_dataset(split='val', n_samples=100)
+    print(f"Preprocessing validation data ({val_samples} samples)...")
+    val_dataset, _ = preprocess_dataset(split='val', n_samples=val_samples)
     
     # preprocess test data
-    test_dataset, _ = preprocess_dataset(split='test', n_samples=100)
+    print(f"Preprocessing test data ({test_samples} samples)...")
+    test_dataset, _ = preprocess_dataset(split='test', n_samples=test_samples)
+    
+    print("\n" + "=" * 60)
+    print("preprocessing complete!")
+    print("=" * 60)
 
